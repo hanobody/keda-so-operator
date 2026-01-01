@@ -52,3 +52,48 @@
 +----------------------------+
 |        Kubernetes HPA      |
 +----------------------------+
+
+## 使用方法
+
+部署方法略.....
+配置方法：
+
+修改keda-so-operator-rules.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rules
+  namespace: monitoring
+data:
+
+#修改名空间必须重启 operator 生效
+#monitoring 是cm所在命名空间 cm在哪就写哪
+#area global是部署应用的命名空间
+  rules.yaml: |
+    namespaces:
+      - area
+      - global
+      - monitoring
+    #匹配 international-  开头的deployment
+    namePrefix: international-
+    #该服务label 必须有  kedascan: "true"
+    labelKey: kedascan
+    labelValue: "true"
+#创建 ScaledObject 的 spec 模板 可以选择CPU或内存等触发器
+#修改这些参数无需重启operator  会自动同步到目前由operator管理的服务
+#删除deployment 或者  删除kedascan标签   scaledobject  会自动级联删除
+  scaledobject-spec.yaml: |
+    minReplicaCount: 1
+    maxReplicaCount: 5
+    pollingInterval: 15
+    cooldownPeriod: 200
+    triggers:
+      - type: cpu
+        metricType: Utilization
+        metadata:
+          value: "90"
+      - type: memory
+        metricType: Utilization
+        metadata:
+          value: "70"
