@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -68,6 +69,17 @@ func scaledObjectReadyState(so *unstructured.Unstructured) string {
 	}
 	return "Unknown"
 }
+func (r *DeploymentReconciler) notifyDeployment(ctx context.Context, action, ns, name, detail string) {
+	if r.Notifier == nil || !r.Notifier.Enabled() {
+		return
+	}
+	msg := fmt.Sprintf("KEDA SO Operator %s\nnamespace: %s\ndeployment: %s\n%s",
+		action, ns, name, detail,
+	)
+	if err := r.Notifier.Send(ctx, msg); err != nil {
+		ctrl.Log.WithName("telegram").Error(err, "send telegram failed")
+	}
+}
 func (r *DeploymentReconciler) notifyScaledObject(ctx context.Context, action, ns, soName, ready string) {
 	if r.Notifier == nil || !r.Notifier.Enabled() {
 		return
@@ -118,7 +130,53 @@ func normalizeJSONValue(v interface{}) interface{} {
 		return v
 	}
 }
+func requiredResourcesFromSpec(spec map[string]interface{}) (needCPU bool, needMemory bool) {
+	triggers, ok := spec["triggers"].([]interface{})
+	if !ok {
+		return false, false
+	}
 
+	for _, t := range triggers {
+		m, ok := t.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(fmt.Sprint(m["type"])) {
+		case "cpu":
+			needCPU = true
+		case "memory":
+			needMemory = true
+		}
+	}
+	return
+}
+
+func missingRequests(deploy *appsv1.Deployment, needCPU, needMemory bool) []string {
+
+	missing := map[string]bool{}
+
+	for _, c := range deploy.Spec.Template.Spec.Containers {
+		req := c.Resources.Requests
+
+		if needCPU {
+			if req == nil || req.Cpu().IsZero() {
+				missing["cpu"] = true
+			}
+		}
+		if needMemory {
+			if req == nil || req.Memory().IsZero() {
+				missing["memory"] = true
+			}
+		}
+	}
+
+	out := make([]string, 0, len(missing))
+	for k := range missing {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 func canonicalJSONBytes(v interface{}) ([]byte, error) {
 	nv := normalizeJSONValue(v)
 	b, err := json.Marshal(nv) // map key 会排序
@@ -371,7 +429,30 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		return ctrl.Result{}, nil
 	}
+	needCPU, needMemory := requiredResourcesFromSpec(rules.ScaledObjectSpec)
 
+	missing := missingRequests(&deploy, needCPU, needMemory)
+	if len(missing) > 0 {
+		msg := fmt.Sprintf(
+			"deployment 缺少 Requests 资源配置: %s",
+			strings.Join(missing, ", "),
+		)
+
+		logger.Info("Skip ScaledObject due to missing requests",
+			"deployment", deploy.Namespace+"/"+deploy.Name,
+			"missing", missing,
+		)
+
+		r.notifyDeployment(
+			ctx,
+			"Skipped ScaledObject",
+			deploy.Namespace,
+			deploy.Name,
+			msg,
+		)
+
+		return ctrl.Result{}, nil
+	}
 	// 4) 匹配：Create/Update ScaledObject，spec 从模板来
 	gvk := schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObject"}
 	soKey := client.ObjectKey{Namespace: deploy.Namespace, Name: soName}
