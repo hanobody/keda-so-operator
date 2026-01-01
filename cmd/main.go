@@ -19,10 +19,13 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	"go.yaml.in/yaml/v2"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -49,6 +52,35 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	// +kubebuilder:scaffold:scheme
+}
+
+type RulesFile struct {
+	Namespaces []string `yaml:"namespaces"`
+}
+
+func loadRulesNamespaces(path string) (map[string]cache.Config, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var rf RulesFile
+	if err := yaml.Unmarshal(b, &rf); err != nil {
+		return nil, err
+	}
+
+	m := map[string]cache.Config{}
+	for _, ns := range rf.Namespaces {
+		ns = strings.TrimSpace(ns)
+		if ns != "" {
+			m[ns] = cache.Config{}
+		}
+	}
+
+	if len(m) == 0 {
+		return nil, fmt.Errorf("namespaces is empty in %s", path)
+	}
+	return m, nil
 }
 
 // nolint:gocyclo
@@ -152,7 +184,16 @@ func main() {
 		metricsServerOptions.CertName = metricsCertName
 		metricsServerOptions.KeyName = metricsCertKey
 	}
-
+	nsMap, err := loadRulesNamespaces("/etc/keda-so-operator/rules.yaml")
+	if err != nil {
+		setupLog.Error(err, "rules.yaml is required, refusing to start",
+			"path", "/etc/keda-so-operator/rules.yaml")
+		os.Exit(1)
+	}
+	if len(nsMap) == 0 {
+		setupLog.Error(nil, "rules.yaml namespaces is empty, refusing to start")
+		os.Exit(1)
+	}
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
@@ -162,11 +203,7 @@ func main() {
 		LeaderElectionID:       "033c34ec.doctor.com",
 
 		Cache: cache.Options{
-			DefaultNamespaces: map[string]cache.Config{
-				"area":       {},
-				"global":     {},
-				"monitoring": {},
-			},
+			DefaultNamespaces: nsMap,
 		},
 	})
 	if err != nil {
@@ -177,8 +214,8 @@ func main() {
 	if err := (&controller.DeploymentReconciler{
 		Client:                  mgr.GetClient(),
 		Scheme:                  mgr.GetScheme(),
-		RulesConfigMapNamespace: "monitoring",
-		RulesConfigMapName:      "keda-auto-scale-rules",
+		RulesConfigMapNamespace: "keda-so-operator-system",
+		RulesConfigMapName:      "keda-so-operator-rules",
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Deployment")
 		os.Exit(1)

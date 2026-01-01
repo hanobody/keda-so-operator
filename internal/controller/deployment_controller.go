@@ -1,12 +1,16 @@
 package controller
 
 import (
+	"bytes"
 	"context"
-	"strconv"
+	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 	"sync/atomic"
 
 	"github.com/go-logr/logr"
+	"go.yaml.in/yaml/v2"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -26,20 +30,90 @@ type runnableFunc func(context.Context) error
 
 func (f runnableFunc) Start(ctx context.Context) error { return f(ctx) }
 
-// DeploymentReconciler reconciles a Deployment object
 type DeploymentReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// --- 规则 ConfigMap 位置（固定） ---
-	RulesConfigMapNamespace string // 例如 "monitoring"
-	RulesConfigMapName      string // 例如 "keda-auto-scale-rules"
+	RulesConfigMapNamespace string
+	RulesConfigMapName      string
 
-	// --- 内存缓存：当前规则（由 ConfigMap 驱动） ---
-	rules atomic.Value // *Rules
+	rules atomic.Value
 
-	// --- 控制“ConfigMap 不存在”的日志只打一次 ---
 	cmNotFoundLogged atomic.Bool
+	cmParseErrLogged atomic.Bool
+}
+
+func normalizeJSONValue(v interface{}) interface{} {
+	switch x := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(x))
+		for k, vv := range x {
+			out[k] = normalizeJSONValue(vv)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, 0, len(x))
+		for _, it := range x {
+			out = append(out, normalizeJSONValue(it))
+		}
+		return out
+
+	case json.Number:
+		if i, err := x.Int64(); err == nil {
+			return float64(i)
+		}
+		if f, err := x.Float64(); err == nil {
+			return f
+		}
+		return x.String()
+
+	case int, int8, int16, int32, int64:
+		return float64(reflect.ValueOf(x).Int())
+
+	case uint, uint8, uint16, uint32, uint64:
+		return float64(reflect.ValueOf(x).Uint())
+
+	case float32:
+		return float64(x)
+	case float64:
+		return x
+
+	default:
+		return v
+	}
+}
+
+func canonicalJSONBytes(v interface{}) ([]byte, error) {
+	nv := normalizeJSONValue(v)
+	b, err := json.Marshal(nv) // map key 会排序
+	if err != nil {
+		return nil, err
+	}
+	// 再做一次 compact，避免空格差异（通常 marshal 已无空格，但保险）
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, b); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func specEqual(currentSpec, desiredSpec interface{}) (bool, error) {
+	cb, err := canonicalJSONBytes(currentSpec)
+	if err != nil {
+		return false, err
+	}
+	db, err := canonicalJSONBytes(desiredSpec)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(cb, db), nil
+}
+func (r *DeploymentReconciler) getRules() *Rules {
+	v := r.rules.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(*Rules)
 }
 
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
@@ -48,151 +122,217 @@ type DeploymentReconciler struct {
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
-// Rules 是从 ConfigMap.Data 解析出来的规则结构
 type Rules struct {
-	Namespace    string
-	NamePrefix   string
-	LabelKey     string
-	LabelValue   string
-	MinReplica   int32
-	MaxReplica   int32
-	CpuThreshold int32
+	// rules.yaml
+	Namespaces []string `yaml:"namespaces"`
+	NamePrefix string   `yaml:"namePrefix"`
+	LabelKey   string   `yaml:"labelKey"`
+	LabelValue string   `yaml:"labelValue"`
+
+	// scaledobject-spec.yaml 解析后的 spec 模板（map[string]any）
+	ScaledObjectSpec map[string]interface{}
 }
 
-func defaultRules() *Rules {
-	return &Rules{
-		Namespace:    "international",
-		NamePrefix:   "international-",
-		LabelKey:     "app.lang",
-		LabelValue:   "java",
-		MinReplica:   1,
-		MaxReplica:   5,
-		CpuThreshold: 80,
+func parseRulesFromConfigMap(cm *corev1.ConfigMap) (*Rules, error) {
+	rulesText := strings.TrimSpace(cm.Data["rules.yaml"])
+	if rulesText == "" {
+		return nil, fmt.Errorf("missing key data[rules.yaml] in ConfigMap %s/%s", cm.Namespace, cm.Name)
 	}
-}
 
-// loadRulesFromConfigMap：解析 cm.Data（缺字段则用默认）
-func loadRulesFromConfigMap(cm *corev1.ConfigMap) *Rules {
-	r := defaultRules()
+	var r Rules
+	if err := yaml.Unmarshal([]byte(rulesText), &r); err != nil {
+		return nil, fmt.Errorf("failed to parse rules.yaml: %w", err)
+	}
 
-	// 允许只覆盖部分字段
-	if v := strings.TrimSpace(cm.Data["namespace"]); v != "" {
-		r.Namespace = v
-	}
-	if v := strings.TrimSpace(cm.Data["namePrefix"]); v != "" {
-		r.NamePrefix = v
-	}
-	if v := strings.TrimSpace(cm.Data["labelKey"]); v != "" {
-		r.LabelKey = v
-	}
-	if v := strings.TrimSpace(cm.Data["labelValue"]); v != "" {
-		r.LabelValue = v
-	}
-	if v := strings.TrimSpace(cm.Data["minReplica"]); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			r.MinReplica = int32(i)
+	// namespaces 变更需要重启；这里仍然要求其存在（main.go 也依赖它）
+	// 但 controller 端仍校验一下，避免空规则导致误删误建
+	cleanedNS := make([]string, 0, len(r.Namespaces))
+	for _, ns := range r.Namespaces {
+		ns = strings.TrimSpace(ns)
+		if ns != "" {
+			cleanedNS = append(cleanedNS, ns)
 		}
 	}
-	if v := strings.TrimSpace(cm.Data["maxReplica"]); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			r.MaxReplica = int32(i)
-		}
+	r.Namespaces = cleanedNS
+
+	if strings.TrimSpace(r.NamePrefix) == "" {
+		return nil, fmt.Errorf("rules.yaml missing namePrefix")
 	}
-	if v := strings.TrimSpace(cm.Data["cpuThreshold"]); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			r.CpuThreshold = int32(i)
-		}
+	if strings.TrimSpace(r.LabelKey) == "" {
+		return nil, fmt.Errorf("rules.yaml missing labelKey")
 	}
-	return r
+	if strings.TrimSpace(r.LabelValue) == "" {
+		return nil, fmt.Errorf("rules.yaml missing labelValue")
+	}
+
+	specText := strings.TrimSpace(cm.Data["scaledobject-spec.yaml"])
+	if specText == "" {
+		return nil, fmt.Errorf("missing key data[scaledobject-spec.yaml] in ConfigMap %s/%s", cm.Namespace, cm.Name)
+	}
+
+	spec := map[string]interface{}{}
+	if err := yaml.Unmarshal([]byte(specText), &spec); err != nil {
+		return nil, fmt.Errorf("failed to parse scaledobject-spec.yaml: %w", err)
+	}
+	r.ScaledObjectSpec = spec
+	m, ok := toStringKeyMap(spec).(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("scaledobject-spec.yaml must be a YAML map/object at top level")
+	}
+
+	r.ScaledObjectSpec = m
+	return &r, nil
 }
 
-func (r *DeploymentReconciler) getRules() *Rules {
-	v := r.rules.Load()
-	if v == nil {
-		// 第一次没有缓存，使用默认
-		return defaultRules()
+// 递归把 YAML 的 map[interface{}]interface{} 转为 map[string]interface{}
+func toStringKeyMap(in interface{}) interface{} {
+	switch v := in.(type) {
+	case map[string]interface{}:
+		out := map[string]interface{}{}
+		for k, val := range v {
+			out[k] = toStringKeyMap(val)
+		}
+		return out
+	case map[interface{}]interface{}:
+		out := map[string]interface{}{}
+		for k, val := range v {
+			ks := fmt.Sprintf("%v", k)
+			out[ks] = toStringKeyMap(val)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, 0, len(v))
+		for _, it := range v {
+			out = append(out, toStringKeyMap(it))
+		}
+		return out
+	default:
+		return in
 	}
-	return v.(*Rules)
 }
 
-// syncRules：从 apiserver 获取 ConfigMap 并更新内存规则（被 ConfigMap 的事件触发时调用）
+func deepCopyMap(in map[string]interface{}) map[string]interface{} {
+	if in == nil {
+		return nil
+	}
+	b, _ := json.Marshal(in)
+	out := map[string]interface{}{}
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
 func (r *DeploymentReconciler) syncRules(ctx context.Context, logger logr.Logger) error {
 	var cm corev1.ConfigMap
 	key := client.ObjectKey{Namespace: r.RulesConfigMapNamespace, Name: r.RulesConfigMapName}
 
 	if err := r.Get(ctx, key, &cm); err != nil {
 		if apierrors.IsNotFound(err) {
-			// 只在 startup/第一次发现 NotFound 时打一次
 			if r.cmNotFoundLogged.CompareAndSwap(false, true) {
-				logger.Info("Rules ConfigMap not found; using default rules",
+				logger.Info("Rules ConfigMap not found; controller will be idle (no default rules)",
 					"configMap", r.RulesConfigMapNamespace+"/"+r.RulesConfigMapName)
 			}
-			r.rules.Store(defaultRules())
+			r.rules.Store((*Rules)(nil))
 			return nil
 		}
 		return err
 	}
-
-	// 找到了 ConfigMap：更新内存规则，并允许以后再次打印 NotFound（比如用户删了再建）
 	r.cmNotFoundLogged.Store(false)
 
-	newRules := loadRulesFromConfigMap(&cm)
-	r.rules.Store(newRules)
+	newRules, err := parseRulesFromConfigMap(&cm)
+	if err != nil {
+		// 解析失败：为了安全，清空规则（不做创建/更新/删除），并打日志（只打一次避免刷屏）
+		if r.cmParseErrLogged.CompareAndSwap(false, true) {
+			logger.Error(err, "Failed to parse rules ConfigMap; controller will be idle until fixed",
+				"configMap", r.RulesConfigMapNamespace+"/"+r.RulesConfigMapName)
+		}
+		r.rules.Store((*Rules)(nil))
+		return nil
+	}
+	r.cmParseErrLogged.Store(false)
 
+	r.rules.Store(newRules)
 	logger.Info("Rules updated from ConfigMap",
 		"configMap", r.RulesConfigMapNamespace+"/"+r.RulesConfigMapName,
-		"namespace", newRules.Namespace,
 		"namePrefix", newRules.NamePrefix,
 		"labelKey", newRules.LabelKey,
 		"labelValue", newRules.LabelValue,
-		"minReplica", newRules.MinReplica,
-		"maxReplica", newRules.MaxReplica,
-		"cpuThreshold", newRules.CpuThreshold)
-
+		"namespaces", newRules.Namespaces,
+	)
 	return nil
 }
+func (r *DeploymentReconciler) deleteManagedScaledObjectIfExists(ctx context.Context, logger logr.Logger, ns, name string) error {
+	gvk := schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObject"}
+	soKey := client.ObjectKey{Namespace: ns, Name: name}
 
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(gvk)
+
+	if err := r.Get(ctx, soKey, current); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+
+	labels := current.GetLabels()
+	if labels == nil || labels["autoscaler.keda.sh/managed-by"] != "keda-so-operator" {
+		return nil
+	}
+
+	if err := r.Delete(ctx, current); err != nil {
+		return err
+	}
+	logger.Info("ScaledObject deleted (no longer matches rules)", "scaledObject", soKey.String())
+	return nil
+}
+func (r *DeploymentReconciler) matchesRules(deploy *appsv1.Deployment, rules *Rules) bool {
+	if rules == nil {
+		return false
+	}
+	if !strings.HasPrefix(deploy.Name, rules.NamePrefix) {
+		return false
+	}
+	if deploy.Labels == nil || deploy.Labels[rules.LabelKey] != rules.LabelValue {
+		return false
+	}
+	// namespace 由 cache 限定 + rules.yaml 声明，这里不再强行等于某个固定 namespace
+	// （因为你 rules.yaml 是多个 namespaces）
+	return true
+}
 func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
-	// 1) 先判断是否是 ConfigMap 事件（同一个 controller watch 了 Deployment + ConfigMap）
+	// 1) ConfigMap 事件
 	if req.Namespace == r.RulesConfigMapNamespace && req.Name == r.RulesConfigMapName {
 		logger.Info("Reconciling rules ConfigMap", "configMap", req.Namespace+"/"+req.Name)
 		if err := r.syncRules(ctx, logger); err != nil {
 			logger.Error(err, "Failed to sync rules from ConfigMap")
 			return ctrl.Result{}, err
 		}
-		// ConfigMap 变更不会直接创建 ScaledObject，这里返回即可
 		return ctrl.Result{}, nil
 	}
 
-	// 2) 正常 Deployment reconcile
+	// 2) Deployment 事件
 	var deploy appsv1.Deployment
 	if err := r.Get(ctx, req.NamespacedName, &deploy); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 3) 极早过滤：不匹配直接 return，避免任何额外动作（尤其避免频繁读 CM）
 	rules := r.getRules()
-
-	if deploy.Namespace != rules.Namespace {
-		return ctrl.Result{}, nil
-	}
-	if !strings.HasPrefix(deploy.Name, rules.NamePrefix) {
-		return ctrl.Result{}, nil
-	}
-	if deploy.Labels == nil || deploy.Labels[rules.LabelKey] != rules.LabelValue {
+	if rules == nil {
+		// 无规则/规则解析失败：为了安全不做任何变更（不建不改不删）
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("Deployment matched rules",
-		"deployment", deploy.Namespace+"/"+deploy.Name,
-		"rulesNamespace", rules.Namespace,
-		"namePrefix", rules.NamePrefix)
-
-	// 4) 构造 ScaledObject（unstructured）
 	soName := deploy.Name + "-scaledobject"
 
+	// 3) 不匹配：删除已有 SO（仅删除 managed-by 的）
+	if !r.matchesRules(&deploy, rules) {
+		if err := r.deleteManagedScaledObjectIfExists(ctx, logger, deploy.Namespace, soName); err != nil {
+			logger.Error(err, "Failed to delete ScaledObject", "deployment", deploy.Namespace+"/"+deploy.Name)
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 4) 匹配：Create/Update ScaledObject，spec 从模板来
 	gvk := schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObject"}
 	soKey := client.ObjectKey{Namespace: deploy.Namespace, Name: soName}
 
@@ -206,33 +346,24 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	desired.SetOwnerReferences([]metav1.OwnerReference{
 		*metav1.NewControllerRef(&deploy, appsv1.SchemeGroupVersion.WithKind("Deployment")),
 	})
-	desired.Object["spec"] = map[string]interface{}{
-		"scaleTargetRef": map[string]interface{}{
-			"name": deploy.Name,
-		},
-		// ⚠️ 这里必须是数字，不要用字符串
-		"minReplicaCount": rules.MinReplica,
-		"maxReplicaCount": rules.MaxReplica,
-		"pollingInterval": int32(15),
-		"cooldownPeriod":  int32(200),
-		"triggers": []interface{}{
-			map[string]interface{}{
-				"type": "cpu",
-				"metadata": map[string]interface{}{
-					"type":  "Utilization",
-					"value": strconv.Itoa(int(rules.CpuThreshold)),
-				},
-			},
-		},
-	}
 
-	// 5) 幂等 Create/Update：先 Get
+	spec := deepCopyMap(rules.ScaledObjectSpec)
+	spec = toStringKeyMap(spec).(map[string]interface{})
+	// 保证 scaleTargetRef.name 正确
+	str, ok := spec["scaleTargetRef"].(map[string]interface{})
+	if !ok || str == nil {
+		str = map[string]interface{}{}
+		spec["scaleTargetRef"] = str
+	}
+	str["name"] = deploy.Name
+
+	desired.Object["spec"] = spec
+
 	current := &unstructured.Unstructured{}
 	current.SetGroupVersionKind(gvk)
 
 	if err := r.Get(ctx, soKey, current); err != nil {
 		if apierrors.IsNotFound(err) {
-			// 不存在 -> Create
 			if err := r.Create(ctx, desired); err != nil {
 				logger.Error(err, "Failed to create ScaledObject", "scaledObject", soKey.String())
 				return ctrl.Result{}, err
@@ -244,27 +375,30 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	// 6) 存在 -> Update（保留 resourceVersion）
+	sameSpec, err := specEqual(current.Object["spec"], desired.Object["spec"])
+	if err != nil {
+		logger.Error(err, "Failed to compare spec; will proceed to update", "scaledObject", soKey.String())
+	} else {
+		if sameSpec && reflect.DeepEqual(current.GetLabels(), desired.GetLabels()) {
+			return ctrl.Result{}, nil
+		}
+	}
+
 	desired.SetResourceVersion(current.GetResourceVersion())
-	// 也可以保留 annotations 等，这里按需合并；目前简单覆盖 spec/labels/ownerrefs
 	if err := r.Update(ctx, desired); err != nil {
 		logger.Error(err, "Failed to update ScaledObject", "scaledObject", soKey.String())
 		return ctrl.Result{}, err
 	}
 	logger.Info("ScaledObject updated", "scaledObject", soKey.String())
-
 	return ctrl.Result{}, nil
 }
 
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// 启动时先把 rules 初始化为默认（避免 nil）
-	r.rules.Store(defaultRules())
-
+	// 启动时先 sync 一次 rules（失败不退出，但 controller idle）
 	if err := mgr.Add(runnableFunc(func(ctx context.Context) error {
 		logger := ctrl.Log.WithName("rules-init")
 		if err := r.syncRules(ctx, logger); err != nil {
-			logger.Error(err, "initial sync rules failed; keep using default rules")
-			return nil
+			logger.Error(err, "initial sync rules failed; controller will be idle until fixed")
 		}
 		return nil
 	})); err != nil {
@@ -276,10 +410,27 @@ func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&corev1.ConfigMap{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				if obj.GetNamespace() == r.RulesConfigMapNamespace && obj.GetName() == r.RulesConfigMapName {
-					return []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(obj)}}
+				if obj.GetNamespace() != r.RulesConfigMapNamespace || obj.GetName() != r.RulesConfigMapName {
+					return nil
 				}
-				return nil
+
+				// 1) 先把 ConfigMap 自己 enqueue（用于触发 syncRules）
+				reqs := []reconcile.Request{
+					{NamespacedName: client.ObjectKeyFromObject(obj)},
+				}
+
+				// 2) 再把 cache 范围内的所有 Deployment enqueue，让它们根据新规则自我 reconcile（更新/删除 SO）
+				var dl appsv1.DeploymentList
+				if err := r.List(ctx, &dl); err != nil {
+					// list 失败就只 enqueue cm，本次规则不会批量生效，但下一次 deployment 变更会生效
+					ctrl.Log.WithName("rules-watch").Error(err, "list deployments failed when rules changed")
+					return reqs
+				}
+				for i := range dl.Items {
+					d := &dl.Items[i]
+					reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(d)})
+				}
+				return reqs
 			}),
 		).
 		Named("deployment").

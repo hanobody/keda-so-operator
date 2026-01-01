@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rules
+  namespace: keda-so-operator-system
+data:
+
+#修改名空间必须重启 operator 生效
+#monitoring 是cm所在命名空间 cm在哪就写哪
+#area global是部署应用的命名空间
+  rules.yaml: |
+    namespaces:
+      - area
+      - global
+      - keda-so-operator-system
+    namePrefix: international-
+    labelKey: kedascan
+    labelValue: "true"
+#创建 ScaledObject 的 spec 模板 可以选择CPU或内存等触发器
+  scaledobject-spec.yaml: |
+    minReplicaCount: 1
+    maxReplicaCount: 5
+    pollingInterval: 15
+    cooldownPeriod: 200
+    triggers:
+      - type: cpu
+        metricType: Utilization
+        metadata:
+          value: "90"
+      - type: memory
+        metricType: Utilization
+        metadata:
+          value: "70"
