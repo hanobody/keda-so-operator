@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/go-logr/logr"
+	"github.com/hanobody/keda-so-operator/internal/notify"
 	"go.yaml.in/yaml/v2"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -41,8 +42,43 @@ type DeploymentReconciler struct {
 
 	cmNotFoundLogged atomic.Bool
 	cmParseErrLogged atomic.Bool
+	Notifier         *notify.TelegramNotifier
 }
 
+func scaledObjectReadyState(so *unstructured.Unstructured) string {
+	status, ok := so.Object["status"].(map[string]interface{})
+	if !ok || status == nil {
+		return "Unknown"
+	}
+	conds, ok := status["conditions"].([]interface{})
+	if !ok || len(conds) == 0 {
+		return "Unknown"
+	}
+	for _, c := range conds {
+		m, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := m["type"].(string); t != "Ready" {
+			continue
+		}
+		if s, _ := m["status"].(string); strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return "Unknown"
+}
+func (r *DeploymentReconciler) notifyScaledObject(ctx context.Context, action, ns, soName, ready string) {
+	if r.Notifier == nil || !r.Notifier.Enabled() {
+		return
+	}
+	msg := fmt.Sprintf("KEDA ScaledObject %s\nnamespace: %s\nname: %s\nready: %s",
+		action, ns, soName, ready,
+	)
+	if err := r.Notifier.Send(ctx, msg); err != nil {
+		ctrl.Log.WithName("telegram").Error(err, "send telegram failed")
+	}
+}
 func normalizeJSONValue(v interface{}) interface{} {
 	switch x := v.(type) {
 	case map[string]interface{}:
@@ -227,12 +263,7 @@ func (r *DeploymentReconciler) syncRules(ctx context.Context, logger logr.Logger
 
 	if err := r.Get(ctx, key, &cm); err != nil {
 		if apierrors.IsNotFound(err) {
-			if r.cmNotFoundLogged.CompareAndSwap(false, true) {
-				logger.Info("Rules ConfigMap not found; controller will be idle (no default rules)",
-					"configMap", r.RulesConfigMapNamespace+"/"+r.RulesConfigMapName)
-			}
-			r.rules.Store((*Rules)(nil))
-			return nil
+			return fmt.Errorf("rules ConfigMap not found: %s/%s", r.RulesConfigMapNamespace, r.RulesConfigMapName)
 		}
 		return err
 	}
@@ -280,6 +311,15 @@ func (r *DeploymentReconciler) deleteManagedScaledObjectIfExists(ctx context.Con
 		return err
 	}
 	logger.Info("ScaledObject deleted (no longer matches rules)", "scaledObject", soKey.String())
+	if r.Notifier != nil {
+		r.notifyScaledObject(
+			ctx,
+			"Deleted",
+			soKey.Namespace,
+			soKey.Name,
+			scaledObjectReadyState(current),
+		)
+	}
 	return nil
 }
 func (r *DeploymentReconciler) matchesRules(deploy *appsv1.Deployment, rules *Rules) bool {
@@ -369,6 +409,16 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				return ctrl.Result{}, err
 			}
 			logger.Info("ScaledObject created", "scaledObject", soKey.String())
+
+			if r.Notifier != nil {
+				r.notifyScaledObject(
+					ctx,
+					"Created",
+					soKey.Namespace,
+					soKey.Name,
+					"创建成功",
+				)
+			}
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get ScaledObject", "scaledObject", soKey.String())
@@ -390,15 +440,32 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 	logger.Info("ScaledObject updated", "scaledObject", soKey.String())
+	var updated unstructured.Unstructured
+	updated.SetGroupVersionKind(gvk)
+	ready := "Unknown"
+	if err := r.Get(ctx, soKey, &updated); err == nil {
+		ready = scaledObjectReadyState(&updated)
+	}
+
+	if r.Notifier != nil {
+		r.notifyScaledObject(
+			ctx,
+			"Updated",
+			soKey.Namespace,
+			soKey.Name,
+			ready,
+		)
+	}
 	return ctrl.Result{}, nil
 }
 
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// 启动时先 sync 一次 rules（失败不退出，但 controller idle）
+	// 启动时先 sync 一次 rules
 	if err := mgr.Add(runnableFunc(func(ctx context.Context) error {
 		logger := ctrl.Log.WithName("rules-init")
 		if err := r.syncRules(ctx, logger); err != nil {
-			logger.Error(err, "initial sync rules failed; controller will be idle until fixed")
+			logger.Error(err, "initial sync rules failed")
+			return err
 		}
 		return nil
 	})); err != nil {

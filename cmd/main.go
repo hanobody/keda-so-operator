@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -28,18 +29,20 @@ import (
 	"go.yaml.in/yaml/v2"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"github.com/hanobody/keda-so-operator/internal/controller"
+	"github.com/hanobody/keda-so-operator/internal/notify"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
-
-	"github.com/hanobody/keda-so-operator/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -78,9 +81,31 @@ func loadRulesNamespaces(path string) (map[string]cache.Config, error) {
 	}
 
 	if len(m) == 0 {
-		return nil, fmt.Errorf("namespaces is empty in %s", path)
+		return nil, fmt.Errorf("namespaces 是空的 in %s", path)
 	}
 	return m, nil
+}
+
+func mustGetEnv(key string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		setupLog.Error(nil, "缺少环境变量", "env", key)
+		os.Exit(1)
+	}
+	return v
+}
+func verifyRulesConfigMap(ctx context.Context, r client.Reader, ns, name string) {
+	var cm corev1.ConfigMap
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &cm); err != nil {
+		setupLog.Error(err, "rules ConfigMap 没找到无法启动", "configMap", ns+"/"+name)
+		os.Exit(1)
+	}
+	if strings.TrimSpace(cm.Data["rules.yaml"]) == "" || strings.TrimSpace(cm.Data["scaledobject-spec.yaml"]) == "" {
+		setupLog.Error(nil, "rules ConfigMap 是错误的，缺少必要的 keys，无法启动",
+			"configMap", ns+"/"+name,
+			"requiredKeys", []string{"rules.yaml", "scaledobject-spec.yaml"})
+		os.Exit(1)
+	}
 }
 
 // nolint:gocyclo
@@ -186,12 +211,12 @@ func main() {
 	}
 	nsMap, err := loadRulesNamespaces("/etc/keda-so-operator/rules.yaml")
 	if err != nil {
-		setupLog.Error(err, "rules.yaml is required, refusing to start",
+		setupLog.Error(err, "rules.yaml 是必须的，无法启动",
 			"path", "/etc/keda-so-operator/rules.yaml")
 		os.Exit(1)
 	}
 	if len(nsMap) == 0 {
-		setupLog.Error(nil, "rules.yaml namespaces is empty, refusing to start")
+		setupLog.Error(nil, "rules.yaml namespaces 是空的，无法启动")
 		os.Exit(1)
 	}
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -210,12 +235,19 @@ func main() {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
-
+	rulesNS := mustGetEnv("POD_NAMESPACE")
+	rulesCM := mustGetEnv("RULES_CONFIGMAP_NAME")
+	verifyRulesConfigMap(context.Background(), mgr.GetAPIReader(), rulesNS, rulesCM)
+	tg := notify.NewTelegramNotifierFromEnv()
+	if !tg.Enabled() {
+		setupLog.Info("telegram notifier disabled (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)")
+	}
 	if err := (&controller.DeploymentReconciler{
 		Client:                  mgr.GetClient(),
 		Scheme:                  mgr.GetScheme(),
-		RulesConfigMapNamespace: "keda-so-operator-system",
-		RulesConfigMapName:      "keda-so-operator-rules",
+		RulesConfigMapNamespace: rulesNS,
+		RulesConfigMapName:      rulesCM,
+		Notifier:                tg,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Deployment")
 		os.Exit(1)

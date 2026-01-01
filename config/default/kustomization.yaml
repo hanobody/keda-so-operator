@@ -1,5 +1,5 @@
 # Adds namespace to all resources.
-namespace: keda-so-operator-system
+namespace: monitoring
 
 # Value of this field is prepended to the
 # names of all resources, e.g. a deployment named
@@ -19,6 +19,7 @@ resources:
 - ../rbac
 - ../manager
 - ../configmap
+- ../secret
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 #- ../webhook

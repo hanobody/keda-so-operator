@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rules
-  namespace: keda-so-operator-system
+  namespace: monitoring
 data:
 
 #修改名空间必须重启 operator 生效
@@ -12,7 +12,7 @@ data:
     namespaces:
       - area
       - global
-      - keda-so-operator-system
+      - monitoring
     namePrefix: international-
     labelKey: kedascan
     labelValue: "true"
