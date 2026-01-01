@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: doctor8181/keda-so-operator
-  newTag: v0.1.0
+  newTag: v0.1.1

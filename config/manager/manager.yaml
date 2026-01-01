@@ -64,6 +64,9 @@ spec:
           - --leader-elect
           - --health-probe-bind-address=:8081
         image: controller:latest
+        env:
+        - name: WATCH_NAMESPACES
+          value: "area,global"
         name: manager
         ports: []
         securityContext:

@@ -4,10 +4,10 @@ metadata:
   name: keda-auto-scale-rules
   namespace: monitoring
 data:
-  namespace: area
-  namePrefix: international-
-  labelKey: keda-app
-  labelValue: true
+  namespace: "area"
+  namePrefix: "international-"
+  labelKey: "app.lang"
+  labelValue: "java"
   minReplica: "1"
   maxReplica: "5"
   cpuThreshold: "80"
