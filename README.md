@@ -67,7 +67,7 @@ metadata:
   namespace: monitoring
 data:
 
-#修改名空间必须重启 operator 生效
+#修改命名空间必须重启 operator 生效
 #monitoring 是cm所在命名空间 cm在哪就写哪
 #area global是部署应用的命名空间
   rules.yaml: |
@@ -75,6 +75,7 @@ data:
       - area
       - global
       - monitoring
+    # 必须至少指定一个命名空间，否则规则配置将被视为无效
     #匹配 international-  开头的deployment
     namePrefix: international-
     #该服务label 必须有  kedascan: "true"
@@ -83,7 +84,7 @@ data:
 #创建 ScaledObject 的 spec 模板 可以选择CPU或内存等触发器
 #修改这些参数无需重启operator  会自动同步到目前由operator管理的服务
 #删除deployment 或者  删除kedascan标签   scaledobject  会自动级联删除
-  scaledobject-spec.yaml: |
+ scaledobject-spec.yaml: |
     minReplicaCount: 1
     maxReplicaCount: 5
     pollingInterval: 15
@@ -97,3 +98,12 @@ data:
         metricType: Utilization
         metadata:
           value: "70"
+## 开发者快速指南
+
+如果你在 VS Code 等本地环境中同步和验证代码，可以参考以下流程：
+
+1. 拉取远程最新代码：`git pull`。
+2. 查看本地改动：使用 VS Code 源码管理面板或运行 `git status`、`git diff`。
+3. 本地验证：至少运行一次核心测试，例如 `go test ./internal/controller -run TestParseRulesFromConfigMap -count=1 -short`。
+4. 提交并推送：`git commit -am "<描述>"` 后执行 `git push origin <分支名>`。
+5. 创建合并请求：在远程仓库填写改动摘要和测试结果，并等待 CI 通过。

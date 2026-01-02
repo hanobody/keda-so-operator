@@ -248,7 +248,9 @@ func parseRulesFromConfigMap(cm *corev1.ConfigMap) (*Rules, error) {
 		}
 	}
 	r.Namespaces = cleanedNS
-
+	if len(r.Namespaces) == 0 {
+		return nil, fmt.Errorf("rules.yaml 必须包含至少一个非空的 namespace")
+	}
 	if strings.TrimSpace(r.NamePrefix) == "" {
 		return nil, fmt.Errorf("rules.yaml missing namePrefix")
 	}
