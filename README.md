@@ -67,7 +67,7 @@ metadata:
   namespace: monitoring
 data:
 
-#修改名空间必须重启 operator 生效
+#修改命名空间必须重启 operator 生效
 #monitoring 是cm所在命名空间 cm在哪就写哪
 #area global是部署应用的命名空间
   rules.yaml: |
@@ -75,6 +75,7 @@ data:
       - area
       - global
       - monitoring
+    # 必须至少指定一个命名空间，否则规则配置将被视为无效
     #匹配 international-  开头的deployment
     namePrefix: international-
     #该服务label 必须有  kedascan: "true"

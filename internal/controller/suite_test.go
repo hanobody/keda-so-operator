@@ -64,6 +64,9 @@ var _ = BeforeSuite(func() {
 	// +kubebuilder:scaffold:scheme
 
 	By("bootstrapping test environment")
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" && getFirstFoundEnvTestBinaryDir() == "" {
+		Skip("envtest binaries not found; set KUBEBUILDER_ASSETS or run make setup-envtest")
+	}
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: false,
