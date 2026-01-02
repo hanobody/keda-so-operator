@@ -28,6 +28,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
+const statusUnknown = "Unknown"
+
 type runnableFunc func(context.Context) error
 
 func (f runnableFunc) Start(ctx context.Context) error { return f(ctx) }
@@ -49,11 +51,11 @@ type DeploymentReconciler struct {
 func scaledObjectReadyState(so *unstructured.Unstructured) string {
 	status, ok := so.Object["status"].(map[string]interface{})
 	if !ok || status == nil {
-		return "Unknown"
+		return statusUnknown
 	}
 	conds, ok := status["conditions"].([]interface{})
 	if !ok || len(conds) == 0 {
-		return "Unknown"
+		return statusUnknown
 	}
 	for _, c := range conds {
 		m, ok := c.(map[string]interface{})
@@ -67,7 +69,7 @@ func scaledObjectReadyState(so *unstructured.Unstructured) string {
 			return s
 		}
 	}
-	return "Unknown"
+	return statusUnknown
 }
 func (r *DeploymentReconciler) notifyDeployment(ctx context.Context, action, ns, name, detail string) {
 	if r.Notifier == nil || !r.Notifier.Enabled() {
@@ -525,7 +527,7 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	logger.Info("ScaledObject updated", "scaledObject", soKey.String())
 	var updated unstructured.Unstructured
 	updated.SetGroupVersionKind(gvk)
-	ready := "Unknown"
+	ready := statusUnknown
 	if err := r.Get(ctx, soKey, &updated); err == nil {
 		ready = scaledObjectReadyState(&updated)
 	}
