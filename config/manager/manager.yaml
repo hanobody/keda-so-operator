@@ -47,6 +47,8 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.namespace
+          - name: CLUSTER_NAME
+            value: US-EKS
           - name: RULES_CONFIGMAP_NAME
             value: keda-so-operator-rules
           - name: TELEGRAM_BOT_TOKEN

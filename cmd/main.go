@@ -236,6 +236,7 @@ func main() {
 		os.Exit(1)
 	}
 	rulesNS := mustGetEnv("POD_NAMESPACE")
+	clusterName := mustGetEnv("CLUSTER_NAME")
 	rulesCM := mustGetEnv("RULES_CONFIGMAP_NAME")
 	verifyRulesConfigMap(context.Background(), mgr.GetAPIReader(), rulesNS, rulesCM)
 	tg := notify.NewTelegramNotifierFromEnv()
@@ -247,6 +248,7 @@ func main() {
 		Scheme:                  mgr.GetScheme(),
 		RulesConfigMapNamespace: rulesNS,
 		RulesConfigMapName:      rulesCM,
+		ClusterName:             clusterName,
 		Notifier:                tg,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Deployment")

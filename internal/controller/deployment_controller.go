@@ -40,8 +40,8 @@ type DeploymentReconciler struct {
 
 	RulesConfigMapNamespace string
 	RulesConfigMapName      string
-
-	rules atomic.Value
+	ClusterName             string
+	rules                   atomic.Value
 
 	cmNotFoundLogged atomic.Bool
 	cmParseErrLogged atomic.Bool
@@ -71,6 +71,7 @@ func scaledObjectReadyState(so *unstructured.Unstructured) string {
 	}
 	return statusUnknown
 }
+
 func (r *DeploymentReconciler) notifyDeployment(ctx context.Context, action, ns, name, detail string) {
 	if r.Notifier == nil || !r.Notifier.Enabled() {
 		return
@@ -82,12 +83,12 @@ func (r *DeploymentReconciler) notifyDeployment(ctx context.Context, action, ns,
 		ctrl.Log.WithName("telegram").Error(err, "send telegram failed")
 	}
 }
-func (r *DeploymentReconciler) notifyScaledObject(ctx context.Context, action, ns, soName, ready string) {
+func (r *DeploymentReconciler) notifyScaledObject(ctx context.Context, action, ns, soName, ready string, clusterName string) {
 	if r.Notifier == nil || !r.Notifier.Enabled() {
 		return
 	}
-	msg := fmt.Sprintf("KEDA ScaledObject %s\nnamespace: %s\nname: %s\nready: %s",
-		action, ns, soName, ready,
+	msg := fmt.Sprintf("KEDA ScaledObject %s\nnamespace: %s\nname: %s\nready: %s\nclusterName: %s",
+		action, ns, soName, ready, clusterName,
 	)
 	if err := r.Notifier.Send(ctx, msg); err != nil {
 		ctrl.Log.WithName("telegram").Error(err, "send telegram failed")
@@ -353,6 +354,7 @@ func (r *DeploymentReconciler) syncRules(ctx context.Context, logger logr.Logger
 	)
 	return nil
 }
+
 func (r *DeploymentReconciler) deleteManagedScaledObjectIfExists(ctx context.Context, logger logr.Logger, ns, name string) error {
 	gvk := schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObject"}
 	soKey := client.ObjectKey{Namespace: ns, Name: name}
@@ -373,6 +375,7 @@ func (r *DeploymentReconciler) deleteManagedScaledObjectIfExists(ctx context.Con
 		return err
 	}
 	logger.Info("ScaledObject deleted (no longer matches rules)", "scaledObject", soKey.String())
+
 	if r.Notifier != nil {
 		r.notifyScaledObject(
 			ctx,
@@ -380,6 +383,7 @@ func (r *DeploymentReconciler) deleteManagedScaledObjectIfExists(ctx context.Con
 			soKey.Namespace,
 			soKey.Name,
 			scaledObjectReadyState(current),
+			r.ClusterName,
 		)
 	}
 	return nil
@@ -502,6 +506,7 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					soKey.Namespace,
 					soKey.Name,
 					"创建成功",
+					r.ClusterName,
 				)
 			}
 			return ctrl.Result{}, nil
@@ -539,6 +544,7 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			soKey.Namespace,
 			soKey.Name,
 			ready,
+			r.ClusterName,
 		)
 	}
 	return ctrl.Result{}, nil
