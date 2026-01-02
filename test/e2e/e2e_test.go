@@ -34,7 +34,7 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "keda-so-operator-system"
+const namespace = "monitoring"
 
 // serviceAccountName created for the project
 const serviceAccountName = "keda-so-operator-controller-manager"
